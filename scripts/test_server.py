@@ -8,10 +8,20 @@ seen, chats, fail_once = [], [], {"429": True}
 
 class Fake(BaseHTTPRequestHandler):
     def do_POST(self):
+        if self.path == "/v1/rerank":
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            n = len(body["documents"]); assert n <= 20
+            data = json.dumps({"data": [{"result": [{"document_id": i, "score": (i + 1) / 100} for i in reversed(range(n))]}], "usage": {"prompt_tokens": n}}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+        if self.path == "/v1/translate":
+            self.rfile.read(int(self.headers["Content-Length"]))
+            data = b'{"translated_text": "hello"}'
+            self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
         if self.path == "/v1/chat/completions":
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             chats.append(body)
-            data = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+            content = "\u6709\u5bb3\nT4" if body.get("model") == "sarashina3-guard" else "ok"
+            data = json.dumps({"id": "c", "choices": [{"index": 0, "finish_reason": "stop", "message": {"content": content}}]}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body["input"] == "rate" and fail_once["429"]:
@@ -69,6 +79,15 @@ try:
     c = chats[-1]; assert c["max_completion_tokens"] == 8000 and "max_tokens" not in c and "logprobs" not in c and c["tool_choice"] == "required", c
     status, r = post({"model": "m", "messages": [], "tools": [{"type": "function"}]}, "/v1/chat/completions")
     assert chats[-1]["tool_choice"] == "auto", chats[-1]
+    # rerank は 20 件ずつに分けて並べ直す
+    status, r = post({"query": "q", "documents": ["d"] * 25, "top_n": 3}, "/v1/rerank")
+    assert status == 200 and len(r["results"]) == 3 and r["results"][0]["relevance_score"] == 0.2 and r["results"][0]["index"] == 19, r
+    status, r = post({"query": "q", "texts": ["a", {"text": "b"}], "return_documents": True}, "/rerank")
+    assert r["results"][0]["index"] == 1 and r["results"][0]["document"]["text"] == "b", r
+    # moderations、completions、translate
+    status, r = post({"input": "x"}, "/v1/moderations"); assert r["results"][0]["flagged"] and r["results"][0]["categories"] == {"T4": True}, r
+    status, r = post({"prompt": "x", "max_tokens": 5}, "/v1/completions"); assert r["choices"][0]["text"] == "ok" and chats[-1]["max_completion_tokens"] == 5, r
+    status, r = post({"text": "x", "source_lang": "ja", "target_lang": "en"}, "/v1/translate"); assert r["translated_text"] == "hello", r
     print("ok")
 finally:
     proc.terminate()

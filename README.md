@@ -1,7 +1,19 @@
 # sarashina-docker
 
-[Sarashina](https://docs.sarashina.ai/) の Embeddings API（`sarashina3-embedding`、1536次元）を、OpenAI 互換の `/v1/embeddings` で出すローカルの変換サーバー。
+[Sarashina](https://docs.sarashina.ai/) の API を、OpenAI 互換などの形で出すローカルの変換サーバー。
 モデルは手元に置かず、計算は Sarashina 側で行う。標準ライブラリだけの `server.py` 1本。
+
+| 口 | 中身 | 形 |
+|---|---|---|
+| `POST /v1/chat/completions` | `sarashina3-mini`、`sarashina3-nano`、`sarashina3.2-mini-thinking`、`sarashina3-guard` | OpenAI。ストリームも中継する |
+| `POST /v1/completions` | チャットに読み替え | OpenAI の古い形。1 件のみ、ストリームなし |
+| `POST /v1/embeddings` | `sarashina3-embedding`（1536次元） | OpenAI |
+| `POST /v1/moderations` | `sarashina3-guard` | OpenAI の形。カテゴリは Sarashina のコード（例 `T4`）をそのまま出す |
+| `POST /v1/rerank`、`POST /rerank` | `sarashina3-rerank` | Cohere／Jina の形（`documents`、`top_n`、`results[].relevance_score`）。`texts` も受ける。20 件ずつ分けて送る |
+| `POST /v1/translate` | `sarashina3-translate` | Sarashina のまま（日英のみ） |
+| `GET /v1/models`、`GET /health` | 一覧と生死 | |
+
+対応していないもの：OpenAI の Responses API、Anthropic の Messages API。Sarashina に音声と画像の API はドキュメントに載っていない。
 
 | 項目 | 値 |
 |---|---|
@@ -22,7 +34,13 @@ curl -s http://127.0.0.1:8082/health     # api_key_configured が true なら鍵
 
 鍵は <https://chat.sarashina.ai/dashboard/api-keys> で発行する。未設定のあいだ `/v1/embeddings` は 503 を返す。
 
-## 埋めている違い
+## チャットで直すところ
+
+`max_tokens` を `max_completion_tokens` に読み替えて 8000 に丸める。`logprobs`、`top_logprobs` を落とす。
+特定の関数を指す `tool_choice` は `required` にする（どの関数かは指定できなくなる）。`tools` があって `tool_choice` が無いときは `auto` を明示する。
+上限は `sarashina3-mini` と `sarashina3.2-mini-thinking` が 30 回/分、`sarashina3-nano` が 60 回/分、`sarashina3-guard` が 6 回/分。
+
+## 埋め込みで埋めている違い
 
 | Sarashina | このサーバー |
 |---|---|
@@ -57,7 +75,7 @@ HINDSIGHT_API_EMBEDDINGS_PASSAGE_PREFIX='[[sarashina:document]]'
 python3 scripts/test_server.py   # 偽の上流で確かめる。鍵も通信も要らない
 ```
 
-**実物の API にはまだ当てていない。**
+実物の確認は `scripts/compare_retrieval.py`（埋め込み）と `scripts/compare_chat.py`（チャット）。どちらも自作の固定の文だけを送る。
 
 ## 規約の注意
 

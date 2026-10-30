@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Sarashina の API を OpenAI 互換で出す変換サーバー（/v1/embeddings と /v1/chat/completions）。
+"""Sarashina の API を OpenAI 互換などの形で出す変換サーバー。
+
+口は /v1/chat/completions、/v1/completions、/v1/embeddings、/v1/moderations、/v1/rerank（/rerank も同じ）、
+/v1/translate、/v1/models。対応表は README。
 
 /v1/chat/completions は次を直して中継する。
 - max_tokens を max_completion_tokens に読み替えて、上限 8000 に丸める（max_tokens は上流で 400）
@@ -38,6 +41,10 @@ RETRY_LIMIT_SECONDS = float(os.environ.get("SARASHINA_RETRY_LIMIT_SECONDS", "65"
 TIMEOUT_SECONDS = float(os.environ.get("SARASHINA_TIMEOUT_SECONDS", "30"))
 CHAT_TIMEOUT_SECONDS = float(os.environ.get("SARASHINA_CHAT_TIMEOUT_SECONDS", "300"))
 CHAT_MAX_COMPLETION_TOKENS = 8000
+RERANK_MODEL = os.environ.get("SARASHINA_RERANK_MODEL", "sarashina3-rerank")
+GUARD_MODEL = os.environ.get("SARASHINA_GUARD_MODEL", "sarashina3-guard")
+RERANK_BATCH = 20
+MODELS = (MODEL, RERANK_MODEL, GUARD_MODEL, "sarashina3-mini", "sarashina3-nano", "sarashina3.2-mini-thinking", "sarashina3-translate")
 
 
 def api_key():
@@ -139,6 +146,70 @@ def open_upstream(path, payload):
             raise UpstreamError(502, f"上流に繋がらない: {error}")
 
 
+def post_json(path, body):
+    with open_upstream(path, json.dumps(body).encode()) as response:
+        return json.load(response)
+
+
+def rerank(request):
+    """Cohere／Jina の形で受けて返す。TEI の texts も受ける。20 件ずつに分けて送り、スコアの高い順に並べ直す。"""
+    documents = request.get("documents", request.get("texts"))
+    query = request.get("query")
+    if not isinstance(query, str) or not isinstance(documents, list) or not documents:
+        raise UpstreamError(400, "query と documents（または texts）を渡す")
+    texts = [d["text"] if isinstance(d, dict) else d for d in documents]
+    body = {"query": query, "model": RERANK_MODEL}
+    for key in ("task_type", "query_instruction"):
+        if key in request:
+            body[key] = request[key]
+    results = []
+    tokens = 0
+    for start in range(0, len(texts), RERANK_BATCH):
+        answer = post_json("/v1/rerank", {**body, "documents": texts[start:start + RERANK_BATCH]})
+        tokens += answer.get("usage", {}).get("prompt_tokens", 0)
+        for item in answer["data"][0]["result"]:
+            results.append({"index": start + item["document_id"], "relevance_score": item["score"]})
+    results.sort(key=lambda r: -r["relevance_score"])
+    top_n = request.get("top_n")
+    if isinstance(top_n, int) and top_n > 0:
+        results = results[:top_n]
+    if request.get("return_documents"):
+        for result in results:
+            result["document"] = {"text": texts[result["index"]]}
+    return {"object": "list", "model": RERANK_MODEL, "results": results, "usage": {"prompt_tokens": tokens, "total_tokens": tokens}}
+
+
+def moderations(request):
+    """OpenAI の moderations の形で返す。sarashina3-guard の答えは 1 行目が 安全／有害、有害なら次の行がカテゴリ。"""
+    inputs = request.get("input")
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    if not isinstance(inputs, list) or not inputs or not all(isinstance(t, str) for t in inputs):
+        raise UpstreamError(400, "input は文字列か文字列の配列で渡す")
+    results = []
+    for text in inputs:
+        answer = post_json("/v1/chat/completions", {"model": GUARD_MODEL, "messages": [{"role": "user", "content": text}]})
+        lines = answer["choices"][0]["message"]["content"].strip().splitlines()
+        flagged = bool(lines) and lines[0].strip() == "有害"
+        categories = {line.strip(): True for line in lines[1:] if line.strip()} if flagged else {}
+        results.append({"flagged": flagged, "categories": categories, "category_scores": {k: 1.0 for k in categories}})
+    return {"id": "modr-sarashina", "model": GUARD_MODEL, "results": results}
+
+
+def completions(request):
+    """古い /v1/completions の形をチャットに読み替える（prompt は 1 件のみ、ストリームなし）。"""
+    prompt = request.get("prompt")
+    if isinstance(prompt, list) and len(prompt) == 1:
+        prompt = prompt[0]
+    if not isinstance(prompt, str) or request.get("stream"):
+        raise UpstreamError(400, "prompt は文字列 1 件で渡す（ストリームは /v1/chat/completions を使う）")
+    body = {k: v for k, v in request.items() if k != "prompt"}
+    body["messages"] = [{"role": "user", "content": prompt}]
+    answer = post_json("/v1/chat/completions", adapt_chat(body))
+    choices = [{"index": c["index"], "text": c["message"].get("content") or "", "finish_reason": c.get("finish_reason"), "logprobs": None} for c in answer["choices"]]
+    return {"id": answer.get("id"), "object": "text_completion", "created": answer.get("created"), "model": answer.get("model"), "choices": choices, "usage": answer.get("usage")}
+
+
 def encode_vector(vector, encoding_format):
     if encoding_format == "base64":
         return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode()
@@ -161,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok", "api_key_configured": bool(api_key())})
         elif self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "sarashina"} for m in (MODEL, "sarashina3-mini", "sarashina3-nano", "sarashina3.2-mini-thinking")]})
+            self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "sarashina"} for m in MODELS]})
         else:
             self._error(404, "not found")
 
@@ -186,8 +257,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
 
+    def _simple(self, convert):
+        """受けた JSON を convert に渡して、返り値を JSON で返す。"""
+        try:
+            request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        except ValueError:
+            self._error(400, "本文が JSON ではない")
+            return
+        try:
+            self._json(200, convert(request))
+        except UpstreamError as error:
+            self._error(error.status, error.message)
+
     def do_POST(self):
-        if self.path not in ("/v1/embeddings", "/v1/chat/completions"):
+        simple = {
+            "/v1/rerank": rerank,
+            "/rerank": rerank,
+            "/v1/moderations": moderations,
+            "/v1/completions": completions,
+            "/v1/translate": lambda request: post_json("/v1/translate", request),
+        }
+        if self.path not in simple and self.path not in ("/v1/embeddings", "/v1/chat/completions"):
             self._error(404, "not found")
             return
         if not api_key():
@@ -195,6 +285,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/chat/completions":
             self._chat()
+            return
+        if self.path in simple:
+            self._simple(simple[self.path])
             return
         try:
             request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
