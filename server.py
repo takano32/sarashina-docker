@@ -44,7 +44,8 @@ CHAT_MAX_COMPLETION_TOKENS = 8000
 RERANK_MODEL = os.environ.get("SARASHINA_RERANK_MODEL", "sarashina3-rerank")
 GUARD_MODEL = os.environ.get("SARASHINA_GUARD_MODEL", "sarashina3-guard")
 RERANK_BATCH = 20
-MODELS = (MODEL, RERANK_MODEL, GUARD_MODEL, "sarashina3-mini", "sarashina3-nano", "sarashina3.2-mini-thinking", "sarashina3-translate")
+TRANSLATE_MODEL = "sarashina3-translate"
+MODELS = (MODEL, RERANK_MODEL, GUARD_MODEL, "sarashina3-mini", "sarashina3-nano", "sarashina3.2-mini-thinking")
 
 
 def api_key():
@@ -58,8 +59,13 @@ class UpstreamError(Exception):
         self.message = message
 
 
-def split_mark(text):
-    """文頭の印を外して (本文, task_type) を返す。"""
+def split_mark(text, requested=None):
+    """文頭の印を外して (本文, task_type) を返す。リクエストに task_type があれば印より優先する。"""
+    if requested:
+        for mark in (QUERY_MARK, DOCUMENT_MARK):
+            if text.startswith(mark):
+                return text[len(mark):], requested
+        return text, requested
     if text.startswith(QUERY_MARK):
         return text[len(QUERY_MARK):], "RETRIEVAL_QUERY"
     if text.startswith(DOCUMENT_MARK):
@@ -72,9 +78,12 @@ def normalize(vector):
     return vector if norm == 0 else [x / norm for x in vector]
 
 
-def embed_one(text):
-    """1件送ってベクトルと使ったトークン数を返す。429 は上限の秒数まで待って送り直す。"""
-    body, task_type = split_mark(text)
+def embed_one(text, requested_task=None, dimensions=None):
+    """1件送ってベクトルと使ったトークン数を返す。429 は上限の秒数まで待って送り直す。
+
+    dimensions は先頭を切り詰めて長さ1に直す（上流にこの指定は無い。README）。
+    """
+    body, task_type = split_mark(text, requested_task)
     payload = json.dumps({"input": body, "task_type": task_type, "model": MODEL}).encode()
     deadline = time.monotonic() + RETRY_LIMIT_SECONDS
     while True:
@@ -86,7 +95,10 @@ def embed_one(text):
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                 result = json.load(response)
-            return normalize(result["data"][0]["embedding"]), result.get("usage", {}).get("prompt_tokens", 0)
+            vector = result["data"][0]["embedding"]
+            if dimensions:
+                vector = vector[:dimensions]
+            return normalize(vector), result.get("usage", {}).get("prompt_tokens", 0)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:500]
             if error.code != 429:
@@ -103,6 +115,15 @@ def embed_one(text):
             raise UpstreamError(502, f"上流に繋がらない: {error}")
 
 
+def flatten_content(message):
+    """content の配列（OpenAI の SDK が送る形）を文字列にする。Sarashina の content は文字列か null だけ。"""
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return message
+    parts = [part if isinstance(part, str) else part.get("text", "") for part in content]
+    return {**message, "content": "".join(parts)}
+
+
 def adapt_chat(request):
     """OpenAI の形のチャットのリクエストを Sarashina が受ける形に直す。"""
     adapted = dict(request)
@@ -112,6 +133,8 @@ def adapt_chat(request):
         adapted["max_completion_tokens"] = min(int(limit), CHAT_MAX_COMPLETION_TOKENS)
     adapted.pop("logprobs", None)
     adapted.pop("top_logprobs", None)
+    if isinstance(adapted.get("messages"), list):
+        adapted["messages"] = [flatten_content(m) for m in adapted["messages"]]
     if isinstance(adapted.get("tool_choice"), dict):
         adapted["tool_choice"] = "required"
     if adapted.get("tools") and "tool_choice" not in adapted:
@@ -176,7 +199,8 @@ def rerank(request):
     if request.get("return_documents"):
         for result in results:
             result["document"] = {"text": texts[result["index"]]}
-    return {"object": "list", "model": RERANK_MODEL, "results": results, "usage": {"prompt_tokens": tokens, "total_tokens": tokens}}
+    native = [{"document_id": r["index"], "score": r["relevance_score"]} for r in results]
+    return {"object": "list", "model": RERANK_MODEL, "results": results, "data": [{"object": "reranked_document_list", "index": 0, "result": native}], "usage": {"prompt_tokens": tokens, "total_tokens": tokens}}
 
 
 def moderations(request):
@@ -210,6 +234,19 @@ def completions(request):
     return {"id": answer.get("id"), "object": "text_completion", "created": answer.get("created"), "model": answer.get("model"), "choices": choices, "usage": answer.get("usage")}
 
 
+def list_models():
+    """上流の一覧を返す。一覧に載らない翻訳のモデルを足す。上流に繋がらないときは手元の一覧を返す。"""
+    fixed = {"id": TRANSLATE_MODEL, "object": "model", "owned_by": "sbintuitions"}
+    try:
+        request = urllib.request.Request(f"{UPSTREAM}/v1/models", headers={"Authorization": f"Bearer {api_key()}"})
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            answer = json.load(response)
+        answer["data"].append(fixed)
+        return answer
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
+        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "sbintuitions"} for m in MODELS] + [fixed]}
+
+
 def encode_vector(vector, encoding_format):
     if encoding_format == "base64":
         return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode()
@@ -232,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok", "api_key_configured": bool(api_key())})
         elif self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "sarashina"} for m in MODELS]})
+            self._json(200, list_models())
         else:
             self._error(404, "not found")
 
@@ -305,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
         total_tokens = 0
         try:
             for index, text in enumerate(texts):
-                vector, tokens = embed_one(text)
+                vector, tokens = embed_one(text, request.get("task_type"), request.get("dimensions"))
                 total_tokens += tokens
                 data.append({"object": "embedding", "index": index, "embedding": encode_vector(vector, encoding_format)})
         except UpstreamError as error:

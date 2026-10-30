@@ -88,6 +88,12 @@ try:
     status, r = post({"input": "x"}, "/v1/moderations"); assert r["results"][0]["flagged"] and r["results"][0]["categories"] == {"T4": True}, r
     status, r = post({"prompt": "x", "max_tokens": 5}, "/v1/completions"); assert r["choices"][0]["text"] == "ok" and chats[-1]["max_completion_tokens"] == 5, r
     status, r = post({"text": "x", "source_lang": "ja", "target_lang": "en"}, "/v1/translate"); assert r["translated_text"] == "hello", r
+    # 仕様の細部: task_type の指定、dimensions、content の配列、rerank の元の形
+    status, r = post({"input": "[[sarashina:query]]x", "task_type": "CLUSTERING", "dimensions": 1})
+    assert seen[-1][:2] == ("x", "CLUSTERING") and r["data"][0]["embedding"] == [1.0], (seen[-1], r)
+    post({"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]}, "/v1/chat/completions")
+    assert chats[-1]["messages"][0]["content"] == "ab", chats[-1]
+    status, r = post({"query": "q", "documents": ["a", "b"]}, "/v1/rerank"); assert r["data"][0]["result"][0] == {"document_id": 1, "score": 0.02}, r
     print("ok")
 finally:
     proc.terminate()
