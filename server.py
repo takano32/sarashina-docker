@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Sarashina の Embeddings API を OpenAI 互換の /v1/embeddings で出す変換サーバー。
+"""Sarashina の API を OpenAI 互換で出す変換サーバー（/v1/embeddings と /v1/chat/completions）。
 
-違いを埋めるのは次のとおり（理由は README）。
+/v1/chat/completions は次を直して中継する。
+- max_tokens を max_completion_tokens に読み替えて、上限 8000 に丸める（max_tokens は上流で 400）
+- logprobs、top_logprobs を落とす（上流で 400 の報告あり）
+- 特定の関数を指す tool_choice を required に読み替える（オブジェクト形式は上流で 400）
+- tools があって tool_choice が無いときは auto を明示する（省くと required で動く報告あり）
+- 429 は Retry-After のぶん待って送り直す
+
+/v1/embeddings で埋める違いは次のとおり（理由は README）。
 - 配列の input を1件ずつに分けて順に送る（Sarashina は1リクエスト1件）
 - 文頭の印を取り除いて task_type に振り替える（Sarashina は task_type が必須）
 - ベクトルを長さ1に正規化する（Sarashina の出力は正規化されていない）
@@ -29,6 +36,8 @@ DOCUMENT_MARK = os.environ.get("SARASHINA_DOCUMENT_MARK", "[[sarashina:document]
 DEFAULT_TASK = os.environ.get("SARASHINA_DEFAULT_TASK", "RETRIEVAL_DOCUMENT")
 RETRY_LIMIT_SECONDS = float(os.environ.get("SARASHINA_RETRY_LIMIT_SECONDS", "65"))
 TIMEOUT_SECONDS = float(os.environ.get("SARASHINA_TIMEOUT_SECONDS", "30"))
+CHAT_TIMEOUT_SECONDS = float(os.environ.get("SARASHINA_CHAT_TIMEOUT_SECONDS", "300"))
+CHAT_MAX_COMPLETION_TOKENS = 8000
 
 
 def api_key():
@@ -87,6 +96,49 @@ def embed_one(text):
             raise UpstreamError(502, f"上流に繋がらない: {error}")
 
 
+def adapt_chat(request):
+    """OpenAI の形のチャットのリクエストを Sarashina が受ける形に直す。"""
+    adapted = dict(request)
+    limit = adapted.pop("max_tokens", None)
+    limit = adapted.get("max_completion_tokens", limit)
+    if limit is not None:
+        adapted["max_completion_tokens"] = min(int(limit), CHAT_MAX_COMPLETION_TOKENS)
+    adapted.pop("logprobs", None)
+    adapted.pop("top_logprobs", None)
+    if isinstance(adapted.get("tool_choice"), dict):
+        adapted["tool_choice"] = "required"
+    if adapted.get("tools") and "tool_choice" not in adapted:
+        adapted["tool_choice"] = "auto"
+    return adapted
+
+
+def open_upstream(path, payload):
+    """上流に送って応答を開く。429 は上限の秒数まで待って送り直す。呼び出し側が閉じる。"""
+    deadline = time.monotonic() + RETRY_LIMIT_SECONDS
+    while True:
+        request = urllib.request.Request(
+            f"{UPSTREAM}{path}",
+            data=payload,
+            headers={"Authorization": f"Bearer {api_key()}", "Content-Type": "application/json"},
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:500]
+            if error.code != 429:
+                raise UpstreamError(error.code, detail)
+            try:
+                wait = float(error.headers.get("Retry-After", "1"))
+            except ValueError:
+                wait = 1.0
+            if time.monotonic() + wait > deadline:
+                raise UpstreamError(429, detail)
+            print(f"429: {wait:.0f} 秒待つ", file=sys.stderr, flush=True)
+            time.sleep(wait)
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise UpstreamError(502, f"上流に繋がらない: {error}")
+
+
 def encode_vector(vector, encoding_format):
     if encoding_format == "base64":
         return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode()
@@ -109,16 +161,40 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok", "api_key_configured": bool(api_key())})
         elif self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "sarashina"}]})
+            self._json(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "sarashina"} for m in (MODEL, "sarashina3-mini", "sarashina3-nano", "sarashina3.2-mini-thinking")]})
         else:
             self._error(404, "not found")
 
+    def _chat(self):
+        try:
+            request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        except ValueError:
+            self._error(400, "本文が JSON ではない")
+            return
+        try:
+            response = open_upstream("/v1/chat/completions", json.dumps(adapt_chat(request)).encode())
+        except UpstreamError as error:
+            self._error(error.status, error.message)
+            return
+        with response:
+            self.send_response(200)
+            self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            while chunk := response.read1(65536):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
     def do_POST(self):
-        if self.path != "/v1/embeddings":
+        if self.path not in ("/v1/embeddings", "/v1/chat/completions"):
             self._error(404, "not found")
             return
         if not api_key():
             self._error(503, "SARASHINA_API_KEY が未設定（~/opt/sarashina-docker/.env に書いて up -d し直す）")
+            return
+        if self.path == "/v1/chat/completions":
+            self._chat()
             return
         try:
             request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))

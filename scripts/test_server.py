@@ -4,10 +4,15 @@ import base64, json, math, os, struct, subprocess, sys, threading, time, urllib.
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-seen, fail_once = [], {"429": True}
+seen, chats, fail_once = [], [], {"429": True}
 
 class Fake(BaseHTTPRequestHandler):
     def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            chats.append(body)
+            data = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body["input"] == "rate" and fail_once["429"]:
             fail_once["429"] = False
@@ -26,8 +31,8 @@ server_py = Path(__file__).resolve().parent.parent / "server.py"
 env = dict(os.environ, SARASHINA_BASE_URL="http://127.0.0.1:18091", SARASHINA_API_KEY="dummy", PORT="18092")
 proc = subprocess.Popen([sys.executable, str(server_py)], env=env, stderr=subprocess.DEVNULL)
 
-def post(payload):
-    req = urllib.request.Request("http://127.0.0.1:18092/v1/embeddings", json.dumps(payload).encode(), {"Content-Type": "application/json"})
+def post(payload, path="/v1/embeddings"):
+    req = urllib.request.Request("http://127.0.0.1:18092" + path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, json.load(r)
@@ -58,6 +63,12 @@ try:
     status, r = post({"input": "bad"}); assert status == 400, r
     # トークン列は断る
     status, r = post({"input": [[1, 2]]}); assert status == 400, r
+    # チャットの読み替え
+    status, r = post({"model": "m", "messages": [], "max_tokens": 99999, "logprobs": True, "tools": [{"type": "function"}], "tool_choice": {"type": "function", "function": {"name": "f"}}}, "/v1/chat/completions")
+    assert status == 200 and r["choices"][0]["message"]["content"] == "ok", r
+    c = chats[-1]; assert c["max_completion_tokens"] == 8000 and "max_tokens" not in c and "logprobs" not in c and c["tool_choice"] == "required", c
+    status, r = post({"model": "m", "messages": [], "tools": [{"type": "function"}]}, "/v1/chat/completions")
+    assert chats[-1]["tool_choice"] == "auto", chats[-1]
     print("ok")
 finally:
     proc.terminate()
