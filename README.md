@@ -19,9 +19,9 @@
 | 項目 | 値 |
 |---|---|
 | compose のプロジェクト | `sarashina` |
-| サービス／コンテナ | `embed`／`sarashina-embed` |
-| 使う側から見る口 | external network `sarashina` 上の `http://sarashina-embed:8080/v1` |
-| ホストからの口 | `127.0.0.1:8082`（`.env` の `SARASHINA_EMBED_PORT`。外には開けない） |
+| サービス／コンテナ | `sarashina`／`sarashina`（2026-11-03 までは `embed`／`sarashina-embed`） |
+| 使う側から見る口 | external network `sarashina` 上の `http://sarashina:8080/v1` |
+| ホストからの口 | `127.0.0.1:8082`（`.env` の `SARASHINA_PORT`。外には開けない） |
 | 鍵 | `.env` の `SARASHINA_API_KEY`（git には入らない） |
 
 ## 使い方

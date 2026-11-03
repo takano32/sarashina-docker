@@ -1,18 +1,18 @@
-# Sarashina の Embeddings API を OpenAI 互換で出すローカルの変換サーバー（モデルは手元に置かない）。
-# ほかの compose プロジェクトは external network `sarashina` に参加して、http://sarashina-embed:8080/v1 に繋ぐ。
+# Sarashina の API（チャット、埋め込み、rerank、moderation、翻訳）を OpenAI 互換などで出すローカルの変換サーバー（モデルは手元に置かない）。
+# ほかの compose プロジェクトは external network `sarashina` に参加して、http://sarashina:8080/v1 に繋ぐ（2026-11-03 までのホスト名は sarashina-embed）。
 # ホスト側からは 127.0.0.1 だけ（外には開けない）。鍵は .env の SARASHINA_API_KEY（README）。
 name: sarashina
 
 services:
-  embed:
+  sarashina:
     image: ${SARASHINA_IMAGE:-python:3.13-alpine}
-    container_name: sarashina-embed
+    container_name: sarashina
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${SARASHINA_EMBED_PORT:-8082}:8080"
+      - "127.0.0.1:${SARASHINA_PORT:-8082}:8080"
     networks:
       default:
-        aliases: [sarashina-embed]
+        aliases: [sarashina]
     environment:
       SARASHINA_API_KEY: ${SARASHINA_API_KEY:-}
       SARASHINA_DEFAULT_TASK: ${SARASHINA_DEFAULT_TASK:-RETRIEVAL_DOCUMENT}
@@ -26,7 +26,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
-    mem_limit: ${SARASHINA_EMBED_MEM_LIMIT:-128m}
+    mem_limit: ${SARASHINA_MEM_LIMIT:-128m}
 
 networks:
   default:

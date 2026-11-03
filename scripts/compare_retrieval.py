@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""手元の埋め込みサーバーと sarashina-embed を、自作の日本語文の小さな検索問題で比べる。
+"""手元の埋め込みサーバーと Sarashina の変換サーバー（sarashina）を、自作の日本語文の小さな検索問題で比べる。
 python3 scripts/compare_retrieval.py [本数の上限なし]。個人情報を含まない固定の文だけを送る。"""
 import json, math, statistics, time, urllib.request
 
